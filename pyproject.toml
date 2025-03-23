@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "sic"
+version = "0.1.0"
+description = "S3 inventory calculator"
+authors = ["tracek <lukasz.tracewski@outlook.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.12, <3.13"
+click = "^8.1.8"
+tqdm = "^4.67.1"
+loguru = "^0.7.3"
+joblib = "^1.4.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
