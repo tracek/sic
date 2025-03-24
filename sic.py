@@ -228,7 +228,133 @@ def process_csv_files(input_dir: Path, output_dir: Path, max_depth: int, n_jobs:
         )
 
 
-@click.command()
+def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 1000000) -> None:
+    """
+    Create an Excel spreadsheet from multiple CSV files in a directory.
+    Each CSV file becomes a separate sheet in the Excel workbook.
+    Sheets are ordered by the level number in the CSV filename.
+    If a sheet would have more than max_rows_per_sheet rows, it is split into multiple sheets.
+
+    Args:
+        csv_dir: Directory containing the CSV files
+        output_file: Path where the Excel file will be saved
+        max_rows_per_sheet: Maximum number of rows per sheet (default: 1,000,000)
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        logger.error("pandas is required for Excel export. Please install it with 'pip install pandas'")
+        return
+
+    # Find all CSV files in the directory
+    csv_files = list(csv_dir.glob("*.csv"))
+    
+    if not csv_files:
+        logger.warning(f"No CSV files found in {csv_dir}")
+        return
+    
+    logger.info(f"Found {len(csv_files)} CSV files to export to Excel")
+    
+    # Sort files by level number
+    def extract_level(filename):
+        # Example: "level_1_sizes.csv" -> 1
+        parts = filename.name.split('_')
+        if len(parts) >= 2 and parts[0] == "level":
+            try:
+                return int(parts[1])
+            except ValueError:
+                return float('inf')  # Place invalid formats at the end
+        return float('inf')
+    
+    csv_files.sort(key=extract_level)
+    
+    # Create Excel writer
+    try:
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            for csv_file in tqdm(csv_files, desc="Exporting to Excel"):
+                # Read CSV file
+                df = pd.read_csv(csv_file)
+                
+                # Use level number as sheet name (e.g., "Level 1")
+                level_num = extract_level(csv_file)
+                if level_num != float('inf'):
+                    base_sheet_name = f"Level {level_num}"
+                else:
+                    # Use filename (without extension) as fallback
+                    base_sheet_name = csv_file.stem
+                
+                # Check if we need to split the sheet due to row limit
+                row_count = len(df)
+                if row_count > max_rows_per_sheet:
+                    logger.info(f"Splitting sheet '{base_sheet_name}' into multiple sheets due to large size ({row_count:,} rows)")
+                    
+                    # Calculate number of sheets needed
+                    num_sheets = (row_count + max_rows_per_sheet - 1) // max_rows_per_sheet
+                    
+                    # Split the dataframe into chunks and create a sheet for each
+                    for i in range(num_sheets):
+                        start_idx = i * max_rows_per_sheet
+                        end_idx = min((i + 1) * max_rows_per_sheet, row_count)
+                        
+                        # Create sheet name with row range
+                        range_sheet_name = f"{base_sheet_name} ({start_idx+1:,}-{end_idx:,})"
+                        
+                        # Truncate sheet name if too long (Excel has a 31 character limit)
+                        if len(range_sheet_name) > 31:
+                            # Use more compact format for large numbers
+                            range_sheet_name = f"{base_sheet_name} ({(start_idx+1)//1000}K-{end_idx//1000}K)"
+                            if len(range_sheet_name) > 31:
+                                range_sheet_name = range_sheet_name[:31]
+                        
+                        # Extract the slice of dataframe for this sheet
+                        df_slice = df.iloc[start_idx:end_idx]
+                        
+                        # Write to Excel
+                        df_slice.to_excel(writer, sheet_name=range_sheet_name, index=False)
+                        
+                        # Auto-adjust column widths
+                        worksheet = writer.sheets[range_sheet_name]
+                        for idx, col in enumerate(df_slice.columns):
+                            # Find the maximum length in the column
+                            max_len = max(
+                                df_slice[col].astype(str).apply(len).max(),  # max length of values
+                                len(str(col))  # length of column name
+                            ) + 2  # Add a little extra space
+                            
+                            # Set the column width
+                            worksheet.column_dimensions[chr(65 + idx)].width = max_len
+                else:
+                    # Standard case - write the dataframe to a single sheet
+                    df.to_excel(writer, sheet_name=base_sheet_name, index=False)
+                    
+                    # Auto-adjust column widths based on content
+                    worksheet = writer.sheets[base_sheet_name]
+                    for idx, col in enumerate(df.columns):
+                        # Find the maximum length in the column
+                        max_len = max(
+                            df[col].astype(str).apply(len).max(),  # max length of values
+                            len(str(col))  # length of column name
+                        ) + 2  # Add a little extra space
+                        
+                        # Set the column width
+                        worksheet.column_dimensions[chr(65 + idx)].width = max_len
+        
+        logger.success(f"Excel file has been created at {output_file}")
+    
+    except Exception as e:
+        logger.error(f"Error creating Excel file: {e}")
+
+
+
+@click.group()
+def cli():
+    """
+    S3 Storage Analysis Tool - Process and visualize S3 inventory data
+    """
+    pass
+
+
+@cli.command()
 @click.option(
     "--input-dir",
     required=True,
@@ -259,17 +385,16 @@ def process_csv_files(input_dir: Path, output_dir: Path, max_depth: int, n_jobs:
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
     help="Set the logging level (default: INFO)",
 )
-def main(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_level: str) -> None:
+def analyze(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_level: str) -> None:
     """
     Process AWS S3 Inventory CSV files and aggregate storage by directory levels.
 
-    This script reads AWS S3 Inventory CSV files and aggregates storage sizes at
+    This command reads AWS S3 Inventory CSV files and aggregates storage sizes at
     directory levels, where level 1 is the top-most directory (e.g., slr0/, slr1/, slr2/)
     and each subsequent level goes one directory deeper, outputting results in GB.
 
     Parallel processing is used to speed up file analysis.
     """
-    # Configure logger level
     logger.remove()
     logger.add(
         sink=lambda msg: tqdm.write(msg, end=""),  # Use tqdm.write to avoid breaking progress bars
@@ -289,5 +414,61 @@ def main(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_lev
     logger.info("Analysis complete!")
 
 
+@cli.command()
+@click.option(
+    "--input-dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Directory containing CSV files to export to Excel",
+)
+@click.option(
+    "--output-file",
+    required=True,
+    type=click.Path(file_okay=True, dir_okay=False, path_type=Path),
+    help="Path where the Excel file will be saved",
+)
+@click.option(
+    "--max-rows",
+    default=1000000,
+    type=int,
+    help="Maximum number of rows per sheet (default: 1,000,000). Sheets with more rows will be split.",
+)
+@click.option(
+    "--log-level",
+    default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
+    help="Set the logging level (default: INFO)",
+)
+def excel_export(input_dir: Path, output_file: Path, max_rows: int, log_level: str) -> None:
+    """
+    Export CSV reports to a single Excel file with multiple sheets.
+    
+    This command takes CSV files generated by the analysis tool and combines them
+    into a single Excel workbook, with each CSV file becoming a separate sheet.
+    Sheets are ordered by level number.
+    
+    If a sheet would have more than the specified maximum number of rows (default: 1,000,000),
+    it will be split into multiple sheets with appropriate range indicators.
+    """
+    # Configure logger level
+    logger.remove()
+    logger.add(
+        sink=lambda msg: tqdm.write(msg, end=""),  # Use tqdm.write to avoid breaking progress bars
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        level=log_level,
+    )
+    
+    logger.info(f"Starting export to Excel (max {max_rows:,} rows per sheet)")
+    
+    # Create parent directory of output file if it doesn't exist
+    output_file.parent.mkdir(exist_ok=True, parents=True)
+    
+    # Export CSV files to Excel
+    export_to_excel(input_dir, output_file, max_rows_per_sheet=max_rows)
+    
+    logger.info("Export complete!")
+
+
+
 if __name__ == "__main__":
-    main()
+    cli()
