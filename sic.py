@@ -51,22 +51,24 @@ def extract_all_directory_levels(prefix: str, max_depth: int = -1) -> List[str]:
     
     return levels
 
-def process_csv_file(csv_file: Path, max_depth: int) -> Dict[int, Dict[str, int]]:
+def process_csv_file(csv_file: Path, max_depth: int) -> Dict[int, Dict[str, Tuple[int, int]]]:
     """
-    Process a single CSV file and return the aggregated sizes.
+    Process a single CSV file and return the aggregated sizes and file counts.
     
     Args:
         csv_file: Path to the CSV file
         max_depth: Maximum directory depth to consider
         
     Returns:
-        Dictionary of {level: {directory: size}}
+        Dictionary of {level: {directory: (size_bytes, file_count)}}
     """
     # Dictionary to store aggregated sizes for each level
-    level_sizes = defaultdict(lambda: defaultdict(int))
+    # For each directory, we store a tuple of (total_size, file_count)
+    level_data = defaultdict(lambda: defaultdict(lambda: [0, 0]))
     
     try:
         with open(csv_file, 'r', newline='') as f:
+            # Use csv module to handle quoted values
             reader = csv.reader(f, quoting=csv.QUOTE_ALL)
             
             for row in reader:
@@ -79,23 +81,36 @@ def process_csv_file(csv_file: Path, max_depth: int) -> Dict[int, Dict[str, int]
                         # Extract directory paths at all levels (top to bottom)
                         dir_levels = extract_all_directory_levels(prefix, max_depth)
                         
-                        # Aggregate sizes for each level
+                        # Detect if this is a file (not a directory)
+                        is_file = '.' in prefix.split('/')[-1] if prefix else False
+                        
+                        # Aggregate sizes and count files for each level
                         for level, dir_path in enumerate(dir_levels, 1):
-                            level_sizes[level][dir_path] += size_bytes
+                            # Update size
+                            level_data[level][dir_path][0] += size_bytes
+                            
+                            # Update file count if this is a file
+                            if is_file:
+                                level_data[level][dir_path][1] += 1
                 except (IndexError, ValueError) as e:
                     # Silent error handling for individual rows
                     pass
     except Exception as e:
         logger.error(f"Error processing file {csv_file}: {e}")
     
-    return dict(level_sizes)  # Convert defaultdict to regular dict for better serialization
+    # Convert the defaultdict values to tuples for better serialization
+    result = {}
+    for level, dirs in level_data.items():
+        result[level] = {dir_path: tuple(data) for dir_path, data in dirs.items()}
+    
+    return result
 
 def process_files_in_batches(
     csv_files: List[Path], 
     max_depth: int, 
     n_jobs: int, 
     batch_size: int = 10
-) -> List[Dict[int, Dict[str, int]]]:
+) -> List[Dict[int, Dict[str, Tuple[int, int]]]]:
     """
     Process files in batches with a progress bar.
     
@@ -122,25 +137,31 @@ def process_files_in_batches(
     return results
 
 def combine_results(
-    results_list: List[Dict[int, Dict[str, int]]]
-) -> Dict[int, Dict[str, int]]:
+    results_list: List[Dict[int, Dict[str, Tuple[int, int]]]]
+) -> Dict[int, Dict[str, Tuple[int, int]]]:
     """
     Combine results from multiple processes.
     
     Args:
-        results_list: List of dictionaries with level sizes from each process
+        results_list: List of dictionaries with level data from each process
         
     Returns:
-        Combined dictionary of {level: {directory: size}}
+        Combined dictionary of {level: {directory: (size_bytes, file_count)}}
     """
-    combined = defaultdict(lambda: defaultdict(int))
+    combined = defaultdict(lambda: defaultdict(lambda: [0, 0]))
     
     for result in results_list:
         for level, dirs in result.items():
-            for dir_path, size in dirs.items():
-                combined[level][dir_path] += size
+            for dir_path, (size, count) in dirs.items():
+                combined[level][dir_path][0] += size  # Add size
+                combined[level][dir_path][1] += count  # Add count
     
-    return dict(combined)
+    # Convert the defaultdict values to tuples
+    result = {}
+    for level, dirs in combined.items():
+        result[level] = {dir_path: tuple(data) for dir_path, data in dirs.items()}
+    
+    return result
 
 def process_csv_files(
     input_dir: Path, 
@@ -158,6 +179,7 @@ def process_csv_files(
         max_depth: Maximum directory depth to consider (-1 for no limit)
         n_jobs: Number of parallel jobs to run (-1 for all available cores)
     """
+    # Find all CSV files in the input directory
     csv_files = list(input_dir.glob("*.csv"))
     
     if not csv_files:
@@ -171,33 +193,33 @@ def process_csv_files(
     
     # Combine results from all processes
     logger.info("Combining results from all files...")
-    level_sizes = combine_results(results)
+    level_data = combine_results(results)
     
     # Determine the maximum level
-    max_level = max(level_sizes.keys()) if level_sizes else 0
+    max_level = max(level_data.keys()) if level_data else 0
     
     # Convert sizes to GB and write to output files
     logger.info("Writing output files...")
     for level in tqdm(range(1, max_level + 1), desc="Writing level reports"):
-        if level not in level_sizes:
+        if level not in level_data:
             continue
             
         output_file = output_dir / f"level_{level}_sizes.csv"
         
         with open(output_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Directory', 'Size (GB)'])
+            writer.writerow(['Directory', 'Size (GB)', 'File Count'])
             
             # Sort by size (descending)
             sorted_dirs = sorted(
-                level_sizes[level].items(), 
-                key=lambda x: x[1], 
+                level_data[level].items(), 
+                key=lambda x: x[1][0],  # Sort by size (first element of tuple)
                 reverse=True
             )
             
-            for dir_path, size_bytes in sorted_dirs:
+            for dir_path, (size_bytes, file_count) in sorted_dirs:
                 size_gb = size_bytes / (1024 ** 3)  # Convert bytes to GB
-                writer.writerow([dir_path, f"{size_gb:.2f}"])
+                writer.writerow([dir_path, f"{size_gb:.2f}", file_count])
     
     logger.success(f"Reports have been written to {output_dir}")
     
@@ -228,7 +250,7 @@ def main(
     Process AWS S3 Inventory CSV files and aggregate storage by directory levels.
     
     This script reads AWS S3 Inventory CSV files and aggregates storage sizes at
-    directory levels, where level 1 is the top-most directory
+    directory levels, where level 1 is the top-most directory (e.g., slr0/, slr1/, slr2/)
     and each subsequent level goes one directory deeper, outputting results in GB.
     
     Parallel processing is used to speed up file analysis.
@@ -243,6 +265,7 @@ def main(
     
     logger.info(f"Starting S3 Storage Analysis with {n_jobs} workers")
     
+    # Create output directory if it doesn't exist
     output_dir.mkdir(exist_ok=True, parents=True)
     logger.debug(f"Ensured output directory exists: {output_dir}")
     
