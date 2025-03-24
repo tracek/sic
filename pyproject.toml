@@ -14,6 +14,15 @@ loguru = "^0.7.3"
 joblib = "^1.4.2"
 
 
+[tool.poetry.group.dev.dependencies]
+black = "^25.1.0"
+mypy = "^1.15.0"
+ruff = "^0.11.2"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 120
+target-version = ['py312']
