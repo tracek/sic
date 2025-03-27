@@ -107,7 +107,6 @@ def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle
             Delete={'Objects': objects, 'Quiet': False}
         )
         
-        # Track any errors that occurred
         if 'Errors' in response and response['Errors']:
             for error in response['Errors']:
                 failed_objects.append({
@@ -117,7 +116,6 @@ def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle
                     'Message': error.get('Message', 'Unknown')
                 })
                 
-        # Apply throttling if requested
         if throttle > 0:
             time.sleep(throttle)
             
@@ -893,25 +891,31 @@ def delete(
             bucket_samples = defaultdict(int)
             
             for curr_bucket, batch in process_s3_deletion_batches(reader, batch_size):
-                # Add to the sample count
-                batch_size_actual = len(batch)
-                bucket_samples[curr_bucket] += batch_size_actual
-                sample_count += batch_size_actual
                 
-                # Show sample objects (up to 10 total)
+                
                 if sample_count <= 10:
                     for obj in batch:
                         logger.info(f"Would delete: s3://{curr_bucket}/{obj['Key']} (Version: {obj['VersionId']})")
+                        sample_count += 1
+                        if sample_count >= 10:
+                            break
+
+                    # Add to the sample count
+                    batch_size_actual = len(batch)
+                    bucket_samples[curr_bucket] += batch_size_actual
+                    sample_count += batch_size_actual
                         
                 # Stop once we've shown enough samples
                 if sample_count >= 10:
                     break
                     
             # Show summary of what would be deleted
+            total_objects = sum(bucket_samples.values())
+            
             logger.info("\nSummary of objects that would be deleted:")
             for b, count in bucket_samples.items():
-                bucket_percent = (count / sample_count) * 100 if sample_count > 0 else 0
-                logger.info(f"  Bucket {b}: {count} objects shown ({bucket_percent:.1f}% of sample)")
+                bucket_percent = (count / total_objects) * 100 if total_objects > 0 else 0
+                logger.info(f"  Bucket {b}: {count:,} objects ({bucket_percent:.1f}% of total)")
                 
             logger.info("\nDry run complete. Use --no-dry-run to perform actual deletion.")
                 
