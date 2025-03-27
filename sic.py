@@ -10,7 +10,6 @@ from pathlib import Path
 from joblib import Parallel, delayed
 from typing import Dict, List, Tuple, Iterator, Optional, Union
 from loguru import logger
-from urllib.parse import urlparse
 
 
 def blocks(file: object, size: int = 65536) -> Iterator[str]:
@@ -46,7 +45,7 @@ def process_s3_deletion_batches(reader: csv.reader, batch_size: int) -> Iterator
     """Process the CSV reader and yield batches of objects for deletion.
     
     Args:
-        reader: CSV reader object
+        reader: CSV reader object with columns [bucket_name, prefix, object_version, ...]
         batch_size: Maximum number of objects per batch
         
     Yields:
@@ -57,36 +56,23 @@ def process_s3_deletion_batches(reader: csv.reader, batch_size: int) -> Iterator
     
     for row in reader:
         try:
-            if len(row) >= 3:
-                s3_path, version_id, is_latest = row[:3]
+            if len(row) >= 3:  # Ensure we have at least bucket, prefix, and version
+                bucket_name, key, version_id = row[:3]
                 
-                # Extract bucket and key from S3 path
-                try:
-                    parsed = urlparse(s3_path)
-                    if parsed.scheme != 's3':
-                        logger.warning(f"Invalid S3 URI scheme in {s3_path}, expected 's3://'")
-                        continue
-                        
-                    bucket = parsed.netloc
-                    key = parsed.path.lstrip("/")
-                    
-                    if not bucket or not key:
-                        logger.warning(f"Invalid S3 path: {s3_path}, unable to extract bucket or key")
-                        continue
-                        
-                    # Add the object to its bucket's batch
-                    bucket_batches[bucket].append({"Key": key, "VersionId": version_id})
-                    
-                    # If we have a full batch for any bucket, yield it
-                    for b, objects in list(bucket_batches.items()):
-                        if len(objects) >= batch_size:
-                            yield b, objects[:batch_size]
-                            # Keep remaining objects for the next batch
-                            bucket_batches[b] = objects[batch_size:]
-                            
-                except Exception as e:
-                    logger.error(f"Error parsing S3 path {s3_path}: {e}")
+                # Skip if any of the required fields are empty
+                if not bucket_name or not key:
+                    logger.warning(f"Skipping row with empty bucket or key: {row}")
                     continue
+                
+                # Add the object to its bucket's batch
+                bucket_batches[bucket_name].append({"Key": key, "VersionId": version_id})
+                
+                # If we have a full batch for any bucket, yield it
+                for b, objects in list(bucket_batches.items()):
+                    if len(objects) >= batch_size:
+                        yield b, objects[:batch_size]
+                        # Keep remaining objects for the next batch
+                        bucket_batches[b] = objects[batch_size:]
             else:
                 logger.warning(f"Skipping invalid row (not enough columns): {row}")
         except Exception as e:
@@ -358,6 +344,25 @@ def process_csv_files(input_dir: Path, output_dir: Path, max_depth: int, n_jobs:
         )
 
 
+def process_batch(
+    curr_bucket: str, 
+    batch: List[Dict[str, str]], 
+    throttle: float = 0
+) -> Tuple[str, int, List[Dict[str, str]]]:
+    """Process a single batch of objects from one bucket.
+    
+    Args:
+        curr_bucket: Bucket name
+        batch: List of objects to delete
+        throttle: Seconds to wait between API calls
+        
+    Returns:
+        Tuple of (bucket_name, success_count, failed_objects)
+    """
+    success, failed = delete_s3_objects_batch(curr_bucket, batch, throttle)
+    return curr_bucket, success, failed
+
+
 def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 1000000) -> None:
     """
     Create an Excel spreadsheet from multiple CSV files in a directory.
@@ -499,20 +504,23 @@ def cli() -> None:
 @click.option(
     "--max-depth",
     default=-1,
+    show_default=True,
     type=int,
-    help="Maximum directory depth to process. Use -1 for no limit (default)",
+    help="Maximum directory depth to process. Use -1 for no limit",
 )
 @click.option(
     "--n-jobs",
     default=-1,
+    show_default=True,
     type=int,
-    help="Number of parallel jobs to run. Use -1 for all available cores (default)",
+    help="Number of parallel jobs to run. Use -1 for all available cores",
 )
 @click.option(
     "--log-level",
     default="INFO",
+    show_default=True,
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
-    help="Set the logging level (default: INFO)",
+    help="Set the logging level",
 )
 def analyze(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_level: str) -> None:
     """
@@ -559,14 +567,16 @@ def analyze(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_
 @click.option(
     "--max-rows",
     default=1000000,
+    show_default=True,
     type=int,
-    help="Maximum number of rows per sheet (default: 1,000,000). Sheets with more rows will be split.",
+    help="Maximum number of rows per sheet. Sheets with more rows will be split",
 )
 @click.option(
     "--log-level",
     default="INFO",
+    show_default=True,
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
-    help="Set the logging level (default: INFO)",
+    help="Set the logging level",
 )
 def excel_export(input_dir: Path, output_file: Path, max_rows: int, log_level: str) -> None:
     """
@@ -600,41 +610,40 @@ def excel_export(input_dir: Path, output_file: Path, max_rows: int, log_level: s
 
 @cli.command()
 @click.argument("csv_input", type=click.Path(exists=True, path_type=Path))
-@click.option("--bucket", help="Specific bucket to target (optional, will be extracted from S3 paths if not provided).")
-@click.option("--jobs", "-j", default=30, type=int, help="Number of parallel jobs.")
-@click.option("--batch-size", default=1000, type=int, help="Batch size for deletion (max 1000).")
-@click.option("--throttle", default=0, type=float, help="Seconds to wait between batch API calls to avoid rate limiting.")
-@click.option("--skip-header/--no-skip-header", default=False, help="Skip the first line of CSV (header row).")
-@click.option("--dry-run/--no-dry-run", default=False, help="Simulate deletion without actually deleting objects.")
-@click.option("--confirm/--no-confirm", default=False, help="Skip confirmation prompt.")
+@click.option("--jobs", "-j", default=30, show_default=True, type=int, help="Number of parallel jobs.")
+@click.option("--batch-size", default=1000, show_default=True, type=int, help="Batch size for deletion (max 1000).")
+@click.option("--throttle", default=0, show_default=True, type=float, help="Seconds to wait between batch API calls to avoid rate limiting.")
+@click.option("--skip-header/--no-skip-header", default=True, show_default=True, help="Skip the first line of CSV (header row).")
+@click.option("--dry-run", is_flag=True, help="Simulate deletion without actually deleting objects.")
+@click.option("--no-confirm", is_flag=True, help="Skip confirmation prompt and proceed with deletion.")
 @click.option(
     "--log-level",
     default="INFO",
+    show_default=True,
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
-    help="Set the logging level (default: INFO)",
+    help="Set the logging level.",
 )
 @click.option("--error-log", type=click.Path(file_okay=True, dir_okay=False, path_type=Path), 
               help="Path to save error log for failed deletions.")
 def delete(
     csv_input: Path, 
-    bucket: Optional[str], 
     jobs: int, 
     batch_size: int, 
     throttle: float, 
     skip_header: bool, 
     dry_run: bool, 
-    confirm: bool, 
+    no_confirm: bool, 
     log_level: str, 
     error_log: Optional[Path]
 ) -> None:
     """
     Permanently delete objects from S3 buckets using a CSV input file.
     
-    The CSV file should contain one object per line with the format:
-    s3://bucket-name/key,version-id,is-latest
+    The CSV file should contain one object per line with at least these columns:
+    bucket_name, prefix, object_version
     
-    The bucket name is extracted from each S3 path. You can optionally specify a
-    target bucket to only delete objects from that specific bucket.
+    Additional columns are allowed but will be ignored. The CSV file is typically
+    generated by AWS S3 Inventory and contains objects from a single bucket.
     
     WARNING: This operation is IRREVERSIBLE. Use --dry-run first to verify
     which objects will be deleted, and consider creating a bucket lifecycle
@@ -668,17 +677,13 @@ def delete(
     # Start processing
     logger.info(f"Found {total_lines} objects to process")
     
-    # If filtering by a specific bucket, inform the user
-    if bucket:
-        logger.info(f"Will only delete objects from bucket: {bucket}")
-        
     # Confirmation step
     if dry_run:
         logger.info(f"DRY RUN MODE: Would process {total_lines} objects")
     else:
-        if not confirm:
+        if not no_confirm:
             if not click.confirm(f"Are you sure you want to permanently delete objects from the S3 paths in {csv_input}?", 
-                               default=False):
+                               default=True):
                 logger.info("Deletion cancelled.")
                 return
         logger.info(f"Starting deletion of objects from {csv_input} using {jobs} parallel jobs.")
@@ -699,16 +704,12 @@ def delete(
             # Sample the first few entries to show what would be deleted
             logger.info("Dry run - showing sample of objects that would be deleted:")
             sample_count = 0
-            sample_bucket_counts = defaultdict(int)
+            bucket_samples = defaultdict(int)
             
             for curr_bucket, batch in process_s3_deletion_batches(reader, batch_size):
-                # Skip if we're targeting a specific bucket
-                if bucket and curr_bucket != bucket:
-                    continue
-                    
                 # Add to the sample count
                 batch_size_actual = len(batch)
-                sample_bucket_counts[curr_bucket] += batch_size_actual
+                bucket_samples[curr_bucket] += batch_size_actual
                 sample_count += batch_size_actual
                 
                 # Show sample objects (up to 10 total)
@@ -722,7 +723,7 @@ def delete(
                     
             # Show summary of what would be deleted
             logger.info("\nSummary of objects that would be deleted:")
-            for b, count in sample_bucket_counts.items():
+            for b, count in bucket_samples.items():
                 bucket_percent = (count / sample_count) * 100 if sample_count > 0 else 0
                 logger.info(f"  Bucket {b}: {count} objects shown ({bucket_percent:.1f}% of sample)")
                 
@@ -737,26 +738,9 @@ def delete(
             # Process in parallel using joblib
             logger.info("Processing objects for deletion...")
             
-            def process_batch(curr_bucket: str, batch: List[Dict[str, str]]) -> Tuple[str, int, List[Dict[str, str]]]:
-                """Process a single batch of objects from one bucket.
-                
-                Args:
-                    curr_bucket: Bucket name
-                    batch: List of objects to delete
-                    
-                Returns:
-                    Tuple of (bucket_name, success_count, failed_objects)
-                """
-                # Skip if we're targeting a specific bucket
-                if bucket and curr_bucket != bucket:
-                    return curr_bucket, 0, []
-                    
-                success, failed = delete_s3_objects_batch(curr_bucket, batch, throttle)
-                return curr_bucket, success, failed
-            
             # Use Parallel to process batches
             batch_results = Parallel(n_jobs=jobs, backend="threading")(
-                delayed(process_batch)(curr_bucket, batch)
+                delayed(process_batch)(curr_bucket, batch, throttle)
                 for curr_bucket, batch in tqdm(
                     process_s3_deletion_batches(reader, batch_size),
                     desc="Processing S3 Batches",
