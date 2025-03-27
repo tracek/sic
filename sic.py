@@ -4,10 +4,13 @@ import csv
 import click
 import boto3
 import time
+import queue
+import threading
 from tqdm import tqdm
 from collections import defaultdict
 from pathlib import Path
 from joblib import Parallel, delayed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Iterator, Optional, Union
 from loguru import logger
 
@@ -361,6 +364,189 @@ def process_batch(
     """
     success, failed = delete_s3_objects_batch(curr_bucket, batch, throttle)
     return curr_bucket, success, failed
+
+
+def partition_prefix(bucket: str, prefix: str, delimiter: str = '/', max_prefixes: int = 1000) -> List[str]:
+    """
+    Partition a prefix into multiple prefixes for parallel processing.
+    
+    Args:
+        bucket: S3 bucket name
+        prefix: Base prefix to partition
+        delimiter: Delimiter to use for partitioning
+        max_prefixes: Maximum number of prefixes to return
+        
+    Returns:
+        List of prefixes to process in parallel
+    """
+    s3 = boto3.client('s3')
+    
+    # If prefix doesn't end with delimiter, get common prefixes under it
+    if prefix and not prefix.endswith(delimiter):
+        prefix = prefix + delimiter if prefix else ""
+    
+    try:
+        # Get common prefixes to parallelize the work
+        paginator = s3.get_paginator('list_objects_v2')
+        common_prefixes = []
+        
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter=delimiter):
+            for cp in page.get('CommonPrefixes', []):
+                common_prefixes.append(cp['Prefix'])
+                
+                # If we've collected enough prefixes, stop
+                if len(common_prefixes) >= max_prefixes:
+                    break
+            
+            # Also break the outer loop if we have enough prefixes
+            if len(common_prefixes) >= max_prefixes:
+                break
+        
+        # If we found some common prefixes, return them
+        if common_prefixes:
+            return common_prefixes
+    except Exception as e:
+        logger.warning(f"Error partitioning prefix {prefix}: {e}")
+    
+    # If no common prefixes or an error occurred, return the original prefix
+    return [prefix]
+
+
+def process_prefix_chunk(bucket: str, prefix: str, marker_queue: queue.Queue, batch_size: int = 10000) -> int:
+    """
+    Process a single prefix chunk and put delete markers into a queue.
+    
+    Args:
+        bucket: S3 bucket name
+        prefix: Prefix to process
+        marker_queue: Queue to put results in
+        batch_size: Number of markers to batch before putting in queue
+        
+    Returns:
+        Count of delete markers found
+    """
+    s3 = boto3.client('s3')
+    paginator = s3.get_paginator('list_object_versions')
+    count = 0
+    batch = []
+    
+    try:
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            delete_markers = page.get('DeleteMarkers', [])
+            for marker in delete_markers:
+                batch.append((
+                    bucket,
+                    marker['Key'],
+                    marker['VersionId'],
+                    marker['IsLatest']
+                ))
+                count += 1
+                
+                # If batch is full, put it in queue and reset
+                if len(batch) >= batch_size:
+                    marker_queue.put(batch)
+                    batch = []
+        
+        # Put any remaining items
+        if batch:
+            marker_queue.put(batch)
+            
+        return count
+    except Exception as e:
+        logger.error(f"Error processing prefix {prefix}: {e}")
+        if batch:
+            marker_queue.put(batch)
+        return count
+
+
+def find_and_write_delete_markers(bucket: str, prefix: str, output_file: Path, 
+                                 jobs: int = 20, batch_size: int = 10000, 
+                                 delimiter: str = '/') -> None:
+    """
+    Find all objects with delete markers in an S3 bucket and write them to a CSV file.
+    
+    Args:
+        bucket: S3 bucket name
+        prefix: Prefix to limit the search
+        output_file: Path to output CSV file
+        jobs: Number of parallel jobs
+        batch_size: Number of markers to batch before writing
+        delimiter: Delimiter to use for prefix partitioning
+    """
+    # Create a queue for communication
+    marker_queue = queue.Queue(maxsize=jobs * 2)  # Buffer some batches
+    stop_event = threading.Event()
+    total_markers = [0]  # Use a list for mutable reference
+    
+    # Partition the prefix for parallel processing
+    logger.info(f"Partitioning prefix '{prefix}' for parallel processing")
+    prefixes = partition_prefix(bucket, prefix, delimiter, max_prefixes=jobs*10)
+    logger.info(f"Found {len(prefixes)} prefixes to process")
+    
+    # Writer thread function
+    def writer_thread():
+        markers_written = 0
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['bucket', 'key', 'version_id', 'is_latest'])
+            
+            with tqdm(desc="Writing delete markers", unit="markers") as pbar:
+                while not (stop_event.is_set() and marker_queue.empty()):
+                    try:
+                        batch = marker_queue.get(timeout=1)
+                        if batch is None:  # Sentinel value
+                            break
+                            
+                        writer.writerows(batch)
+                        batch_size = len(batch)
+                        markers_written += batch_size
+                        pbar.update(batch_size)
+                        marker_queue.task_done()
+                    except queue.Empty:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error writing to file: {e}")
+                
+                total_markers[0] = markers_written
+    
+    # Start the writer thread
+    writer = threading.Thread(target=writer_thread)
+    writer.daemon = True
+    writer.start()
+    
+    # Process prefixes in parallel with progress tracking
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        # Submit all prefix chunks to executor
+        futures = {
+            executor.submit(
+                process_prefix_chunk, 
+                bucket, 
+                chunk_prefix, 
+                marker_queue, 
+                batch_size
+            ): chunk_prefix for chunk_prefix in prefixes
+        }
+        
+        # Track progress with tqdm
+        with tqdm(total=len(prefixes), desc="Processing prefixes", unit="prefix") as pbar:
+            for future in as_completed(futures):
+                prefix_val = futures[future]
+                try:
+                    result = future.result()
+                    logger.debug(f"Prefix '{prefix_val}': Found {result} delete markers")
+                except Exception as e:
+                    logger.error(f"Error processing prefix '{prefix_val}': {e}")
+                
+                pbar.update(1)
+    
+    # Signal the writer to stop by putting a sentinel value
+    marker_queue.put(None)
+    
+    # Wait for writer to finish
+    writer.join()
+    
+    logger.success(f"Completed finding delete markers. Total found: {total_markers[0]}")
+    logger.info(f"Results written to {output_file}")
 
 
 def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 1000000) -> None:
@@ -778,6 +964,64 @@ def delete(
                 logger.info(f"Error log saved to {error_log}")
                 
     logger.info("Operation complete.")
+
+
+@cli.command()
+@click.option("--bucket", required=True, help="S3 bucket to scan for delete markers")
+@click.option("--prefix", default="", show_default=True, help="Optional prefix to limit the search scope")
+@click.option("--output", required=True, type=click.Path(dir_okay=False, path_type=Path), help="Output CSV file path")
+@click.option("--jobs", "-j", default=20, show_default=True, type=int, help="Number of parallel jobs")
+@click.option("--batch-size", default=10000, show_default=True, type=int, help="Number of markers to buffer before writing")
+@click.option("--delimiter", default="/", show_default=True, help="Delimiter to use for prefix partitioning")
+@click.option(
+    "--log-level",
+    default="INFO",
+    show_default=True,
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
+    help="Set the logging level",
+)
+def find_deleted(
+    bucket: str,
+    prefix: str,
+    output: Path,
+    jobs: int,
+    batch_size: int,
+    delimiter: str,
+    log_level: str
+) -> None:
+    """
+    Find all objects with delete markers in an S3 bucket and write them to a CSV file.
+    
+    This command efficiently searches for delete markers in a versioned S3 bucket and
+    writes the results to a CSV file with the format: bucket,key,version_id,is_latest
+    
+    For buckets with hundreds of millions of objects, this command uses:
+    
+    1. Intelligent prefix partitioning to enable parallel processing
+    2. Multi-threaded S3 API calls for maximum throughput
+    3. Buffered writing to optimize I/O performance
+    4. Progress tracking for both prefix processing and output writing
+    
+    The output file can be used with the 'delete' command to permanently remove the
+    delete markers, making the objects visible again or cleaning up the version history.
+    """
+    # Configure logger
+    logger.remove()
+    logger.add(
+        sink=lambda msg: tqdm.write(msg, end=""),
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        level=log_level,
+    )
+    
+    logger.info(f"Starting to find delete markers in bucket '{bucket}' with prefix '{prefix}'")
+    
+    # Create parent directory of output file if it doesn't exist
+    output.parent.mkdir(exist_ok=True, parents=True)
+    
+    # Run the optimized search and write function
+    find_and_write_delete_markers(bucket, prefix, output, jobs, batch_size, delimiter)
+    
+    logger.info("Operation complete!")
 
 
 if __name__ == "__main__":
