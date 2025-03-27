@@ -27,7 +27,8 @@ def blocks(file: object, size: int = 65536) -> Iterator[str]:
     """
     while True:
         b = file.read(size)
-        if not b: break
+        if not b:
+            break
         yield b
 
 
@@ -891,8 +892,7 @@ def delete(
             bucket_samples = defaultdict(int)
             
             for curr_bucket, batch in process_s3_deletion_batches(reader, batch_size):
-                
-                
+
                 if sample_count <= 10:
                     for obj in batch:
                         logger.info(f"Would delete: s3://{curr_bucket}/{obj['Key']} (Version: {obj['VersionId']})")
