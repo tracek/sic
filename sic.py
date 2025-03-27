@@ -105,21 +105,6 @@ def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle
     s3 = boto3.client('s3')
     failed_objects = []
 
-    # Define the backoff condition for S3 throttling
-    def is_throttling_exception(exception):
-        return (
-            isinstance(exception, botocore.exceptions.ClientError) and 
-            (
-                exception.response.get('Error', {}).get('Code') == 'SlowDown' or
-                exception.response.get('Error', {}).get('Code') == 'ServiceUnavailable' or
-                exception.response.get('Error', {}).get('Code') == '503' or
-                # Throttling can also appear as:
-                exception.response.get('Error', {}).get('Code') == 'ThrottlingException' or 
-                exception.response.get('Error', {}).get('Code') == 'TooManyRequestsException' or
-                exception.response.get('Error', {}).get('Code') == 'ProvisionedThroughputExceededException'
-            )
-        )
-
     # Define the backoff condition for when a prefix has been deleted
     def is_non_retryable_exception(exception):
         if isinstance(exception, botocore.exceptions.ClientError):
@@ -136,10 +121,8 @@ def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle
     @backoff.on_exception(
         backoff.expo,
         botocore.exceptions.ClientError,
-        max_tries=5,  # Maximum of 5 attempts
         max_time=300,  # Maximum of 5 minutes total retry time
         giveup=is_non_retryable_exception,  # Don't retry if resource is already gone
-        retry_if_exception=is_throttling_exception,  # Only retry on throttling exceptions
         on_backoff=lambda details: logger.warning(
             f"Backing off {details['wait']:.1f} seconds after {details['tries']} tries "
             f"calling S3 delete_objects for bucket {bucket}"
@@ -147,7 +130,8 @@ def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle
         on_giveup=lambda details: logger.error(
             f"Giving up on S3 delete_objects for bucket {bucket} after {details['tries']} tries"
         ),
-        factor=2,  # Start with a minimum of 2 seconds delay
+        base=2,  # Exponential backoff starting at 2 seconds
+        factor=5,  # Start with a minimum of 2 seconds delay
         jitter=backoff.full_jitter,
     )
     def delete_with_backoff():
