@@ -2,12 +2,142 @@
 
 import csv
 import click
+import boto3
+import time
 from tqdm import tqdm
 from collections import defaultdict
 from pathlib import Path
 from joblib import Parallel, delayed
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterator, Optional, Union
 from loguru import logger
+from urllib.parse import urlparse
+
+
+def blocks(file: object, size: int = 65536) -> Iterator[str]:
+    """Efficiently read a file in blocks.
+    
+    Args:
+        file: Open file handle
+        size: Block size in bytes
+        
+    Yields:
+        Blocks of file content
+    """
+    while True:
+        b = file.read(size)
+        if not b: break
+        yield b
+
+
+def count_file_lines(filepath: Union[str, Path]) -> int:
+    """Count lines in a file efficiently.
+    
+    Args:
+        filepath: Path to the file
+        
+    Returns:
+        Number of lines in the file
+    """
+    with open(filepath, "r", encoding="utf-8", errors='ignore') as f:
+        return sum(bl.count("\n") for bl in blocks(f))
+
+
+def process_s3_deletion_batches(reader: csv.reader, batch_size: int) -> Iterator[Tuple[str, List[Dict[str, str]]]]:
+    """Process the CSV reader and yield batches of objects for deletion.
+    
+    Args:
+        reader: CSV reader object
+        batch_size: Maximum number of objects per batch
+        
+    Yields:
+        Tuples of (bucket_name, batch_of_objects) for S3 deletion
+    """
+    # Use a dictionary to group objects by bucket
+    bucket_batches: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    
+    for row in reader:
+        try:
+            if len(row) >= 3:
+                s3_path, version_id, is_latest = row[:3]
+                
+                # Extract bucket and key from S3 path
+                try:
+                    parsed = urlparse(s3_path)
+                    if parsed.scheme != 's3':
+                        logger.warning(f"Invalid S3 URI scheme in {s3_path}, expected 's3://'")
+                        continue
+                        
+                    bucket = parsed.netloc
+                    key = parsed.path.lstrip("/")
+                    
+                    if not bucket or not key:
+                        logger.warning(f"Invalid S3 path: {s3_path}, unable to extract bucket or key")
+                        continue
+                        
+                    # Add the object to its bucket's batch
+                    bucket_batches[bucket].append({"Key": key, "VersionId": version_id})
+                    
+                    # If we have a full batch for any bucket, yield it
+                    for b, objects in list(bucket_batches.items()):
+                        if len(objects) >= batch_size:
+                            yield b, objects[:batch_size]
+                            # Keep remaining objects for the next batch
+                            bucket_batches[b] = objects[batch_size:]
+                            
+                except Exception as e:
+                    logger.error(f"Error parsing S3 path {s3_path}: {e}")
+                    continue
+            else:
+                logger.warning(f"Skipping invalid row (not enough columns): {row}")
+        except Exception as e:
+            logger.error(f"Error processing row {row}: {e}")
+    
+    # Yield any remaining batches
+    for bucket, objects in bucket_batches.items():
+        if objects:
+            yield bucket, objects
+
+
+def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle: float = 0) -> Tuple[int, List[Dict[str, str]]]:
+    """Delete a batch of S3 objects.
+    
+    Args:
+        bucket: S3 bucket name
+        objects: List of objects to delete (each with Key and VersionId)
+        throttle: Seconds to wait between API calls
+        
+    Returns:
+        Tuple of (success_count, failed_objects)
+    """
+    s3 = boto3.client('s3')
+    failed_objects = []
+    
+    try:
+        response = s3.delete_objects(
+            Bucket=bucket, 
+            Delete={'Objects': objects, 'Quiet': False}
+        )
+        
+        # Track any errors that occurred
+        if 'Errors' in response and response['Errors']:
+            for error in response['Errors']:
+                failed_objects.append({
+                    'Key': error.get('Key', 'Unknown'),
+                    'VersionId': error.get('VersionId', 'Unknown'),
+                    'Code': error.get('Code', 'Unknown'),
+                    'Message': error.get('Message', 'Unknown')
+                })
+                
+        # Apply throttling if requested
+        if throttle > 0:
+            time.sleep(throttle)
+            
+        return len(objects) - len(failed_objects), failed_objects
+    
+    except Exception as e:
+        logger.error(f"Failed batch delete in bucket {bucket}: {e}")
+        # Return all objects as failed in case of exception
+        return 0, objects
 
 
 def extract_all_directory_levels(prefix: str, max_depth: int = -1) -> List[str]:
@@ -345,9 +475,8 @@ def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 
         logger.error(f"Error creating Excel file: {e}")
 
 
-
 @click.group()
-def cli():
+def cli() -> None:
     """
     S3 Storage Analysis Tool - Process and visualize S3 inventory data
     """
@@ -468,6 +597,203 @@ def excel_export(input_dir: Path, output_file: Path, max_rows: int, log_level: s
     
     logger.info("Export complete!")
 
+
+@cli.command()
+@click.argument("csv_input", type=click.Path(exists=True, path_type=Path))
+@click.option("--bucket", help="Specific bucket to target (optional, will be extracted from S3 paths if not provided).")
+@click.option("--jobs", "-j", default=30, type=int, help="Number of parallel jobs.")
+@click.option("--batch-size", default=1000, type=int, help="Batch size for deletion (max 1000).")
+@click.option("--throttle", default=0, type=float, help="Seconds to wait between batch API calls to avoid rate limiting.")
+@click.option("--skip-header/--no-skip-header", default=False, help="Skip the first line of CSV (header row).")
+@click.option("--dry-run/--no-dry-run", default=False, help="Simulate deletion without actually deleting objects.")
+@click.option("--confirm/--no-confirm", default=False, help="Skip confirmation prompt.")
+@click.option(
+    "--log-level",
+    default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
+    help="Set the logging level (default: INFO)",
+)
+@click.option("--error-log", type=click.Path(file_okay=True, dir_okay=False, path_type=Path), 
+              help="Path to save error log for failed deletions.")
+def delete(
+    csv_input: Path, 
+    bucket: Optional[str], 
+    jobs: int, 
+    batch_size: int, 
+    throttle: float, 
+    skip_header: bool, 
+    dry_run: bool, 
+    confirm: bool, 
+    log_level: str, 
+    error_log: Optional[Path]
+) -> None:
+    """
+    Permanently delete objects from S3 buckets using a CSV input file.
+    
+    The CSV file should contain one object per line with the format:
+    s3://bucket-name/key,version-id,is-latest
+    
+    The bucket name is extracted from each S3 path. You can optionally specify a
+    target bucket to only delete objects from that specific bucket.
+    
+    WARNING: This operation is IRREVERSIBLE. Use --dry-run first to verify
+    which objects will be deleted, and consider creating a bucket lifecycle
+    rule instead for safer management of object retention.
+    """
+    # Configure logger
+    logger.remove()
+    logger.add(
+        sink=lambda msg: tqdm.write(msg, end=""),
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        level=log_level,
+    )
+    
+    # Validate batch size
+    if batch_size > 1000:
+        logger.warning("Batch size cannot exceed 1000. Setting to 1000.")
+        batch_size = 1000
+    
+    # Count lines efficiently
+    logger.info(f"Counting objects in {csv_input}...")
+    total_lines = count_file_lines(csv_input)
+    
+    if skip_header and total_lines > 0:
+        total_lines -= 1
+    
+    # Skip further processing if there are no lines to process
+    if total_lines <= 0:
+        logger.warning("No objects found in the input file.")
+        return
+    
+    # Start processing
+    logger.info(f"Found {total_lines} objects to process")
+    
+    # If filtering by a specific bucket, inform the user
+    if bucket:
+        logger.info(f"Will only delete objects from bucket: {bucket}")
+        
+    # Confirmation step
+    if dry_run:
+        logger.info(f"DRY RUN MODE: Would process {total_lines} objects")
+    else:
+        if not confirm:
+            if not click.confirm(f"Are you sure you want to permanently delete objects from the S3 paths in {csv_input}?", 
+                               default=False):
+                logger.info("Deletion cancelled.")
+                return
+        logger.info(f"Starting deletion of objects from {csv_input} using {jobs} parallel jobs.")
+    
+    # Process CSV file in batches
+    all_failed_objects = []
+    bucket_object_counts = defaultdict(int)
+    
+    with open(csv_input, "r") as file:
+        reader = csv.reader(file)
+        
+        # Skip header if requested
+        if skip_header:
+            next(reader, None)
+        
+        # First pass to count objects by bucket for better progress reporting
+        if dry_run:
+            # Sample the first few entries to show what would be deleted
+            logger.info("Dry run - showing sample of objects that would be deleted:")
+            sample_count = 0
+            sample_bucket_counts = defaultdict(int)
+            
+            for curr_bucket, batch in process_s3_deletion_batches(reader, batch_size):
+                # Skip if we're targeting a specific bucket
+                if bucket and curr_bucket != bucket:
+                    continue
+                    
+                # Add to the sample count
+                batch_size_actual = len(batch)
+                sample_bucket_counts[curr_bucket] += batch_size_actual
+                sample_count += batch_size_actual
+                
+                # Show sample objects (up to 10 total)
+                if sample_count <= 10:
+                    for obj in batch:
+                        logger.info(f"Would delete: s3://{curr_bucket}/{obj['Key']} (Version: {obj['VersionId']})")
+                        
+                # Stop once we've shown enough samples
+                if sample_count >= 10:
+                    break
+                    
+            # Show summary of what would be deleted
+            logger.info("\nSummary of objects that would be deleted:")
+            for b, count in sample_bucket_counts.items():
+                bucket_percent = (count / sample_count) * 100 if sample_count > 0 else 0
+                logger.info(f"  Bucket {b}: {count} objects shown ({bucket_percent:.1f}% of sample)")
+                
+            logger.info("\nDry run complete. Use --no-dry-run to perform actual deletion.")
+                
+        else:
+            # Rewind file to start for actual processing
+            file.seek(0)
+            if skip_header:
+                next(reader, None)
+                
+            # Process in parallel using joblib
+            logger.info("Processing objects for deletion...")
+            
+            def process_batch(curr_bucket: str, batch: List[Dict[str, str]]) -> Tuple[str, int, List[Dict[str, str]]]:
+                """Process a single batch of objects from one bucket.
+                
+                Args:
+                    curr_bucket: Bucket name
+                    batch: List of objects to delete
+                    
+                Returns:
+                    Tuple of (bucket_name, success_count, failed_objects)
+                """
+                # Skip if we're targeting a specific bucket
+                if bucket and curr_bucket != bucket:
+                    return curr_bucket, 0, []
+                    
+                success, failed = delete_s3_objects_batch(curr_bucket, batch, throttle)
+                return curr_bucket, success, failed
+            
+            # Use Parallel to process batches
+            batch_results = Parallel(n_jobs=jobs, backend="threading")(
+                delayed(process_batch)(curr_bucket, batch)
+                for curr_bucket, batch in tqdm(
+                    process_s3_deletion_batches(reader, batch_size),
+                    desc="Processing S3 Batches",
+                    mininterval=1
+                )
+            )
+            
+            # Process results
+            for curr_bucket, success_count, failed_objects in batch_results:
+                bucket_object_counts[curr_bucket] += success_count
+                all_failed_objects.extend([(curr_bucket, obj) for obj in failed_objects])
+            
+            # Log results
+            total_deleted = sum(bucket_object_counts.values())
+            logger.info("\nDeletion Summary:")
+            logger.info(f"Total processed: {total_lines}, Successfully deleted: {total_deleted}, Failed: {len(all_failed_objects)}")
+            
+            # Show per-bucket summary
+            for b, count in bucket_object_counts.items():
+                logger.info(f"  Bucket {b}: {count} objects deleted")
+            
+            # Save error log if requested
+            if error_log and all_failed_objects:
+                with open(error_log, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Bucket", "Key", "VersionId", "Error Code", "Error Message"])
+                    for curr_bucket, obj in all_failed_objects:
+                        writer.writerow([
+                            curr_bucket,
+                            obj.get("Key", ""),
+                            obj.get("VersionId", ""),
+                            obj.get("Code", ""),
+                            obj.get("Message", "")
+                        ])
+                logger.info(f"Error log saved to {error_log}")
+                
+    logger.info("Operation complete.")
 
 
 if __name__ == "__main__":
