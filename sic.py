@@ -6,6 +6,9 @@ import boto3
 import time
 import queue
 import threading
+import backoff
+import botocore.exceptions
+
 from tqdm import tqdm
 from collections import defaultdict
 from pathlib import Path
@@ -89,7 +92,7 @@ def process_s3_deletion_batches(reader: csv.reader, batch_size: int) -> Iterator
 
 
 def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle: float = 0) -> Tuple[int, List[Dict[str, str]]]:
-    """Delete a batch of S3 objects.
+    """Delete a batch of S3 objects with exponential backoff for rate limiting.
     
     Args:
         bucket: S3 bucket name
@@ -101,31 +104,99 @@ def delete_s3_objects_batch(bucket: str, objects: List[Dict[str, str]], throttle
     """
     s3 = boto3.client('s3')
     failed_objects = []
+
+    # Define the backoff condition for S3 throttling
+    def is_throttling_exception(exception):
+        return (
+            isinstance(exception, botocore.exceptions.ClientError) and 
+            (
+                exception.response.get('Error', {}).get('Code') == 'SlowDown' or
+                exception.response.get('Error', {}).get('Code') == 'ServiceUnavailable' or
+                exception.response.get('Error', {}).get('Code') == '503' or
+                # Throttling can also appear as:
+                exception.response.get('Error', {}).get('Code') == 'ThrottlingException' or 
+                exception.response.get('Error', {}).get('Code') == 'TooManyRequestsException' or
+                exception.response.get('Error', {}).get('Code') == 'ProvisionedThroughputExceededException'
+            )
+        )
+
+    # Define the backoff condition for when a prefix has been deleted
+    def is_non_retryable_exception(exception):
+        if isinstance(exception, botocore.exceptions.ClientError):
+            error_code = exception.response.get('Error', {}).get('Code')
+            # Check for various "not found" error codes that indicate a prefix is already deleted
+            if error_code in ['NoSuchKey', 'NoSuchBucket', 'NoSuchVersion', 'NotFound', '404']:
+                logger.warning(f"Skipping objects in bucket {bucket} as they appear to be already deleted: {error_code}")
+                # For these errors, we'll treat this as a "success" in that we don't need to delete them again
+                # but we'll log it differently
+                return True
+        return False
+
+    # Backoff decorator for the delete operation
+    @backoff.on_exception(
+        backoff.expo,
+        botocore.exceptions.ClientError,
+        max_tries=5,  # Maximum of 5 attempts
+        max_time=300,  # Maximum of 5 minutes total retry time
+        giveup=is_non_retryable_exception,  # Don't retry if resource is already gone
+        retry_if_exception=is_throttling_exception,  # Only retry on throttling exceptions
+        on_backoff=lambda details: logger.warning(
+            f"Backing off {details['wait']:.1f} seconds after {details['tries']} tries "
+            f"calling S3 delete_objects for bucket {bucket}"
+        ),
+        on_giveup=lambda details: logger.error(
+            f"Giving up on S3 delete_objects for bucket {bucket} after {details['tries']} tries"
+        ),
+        factor=2,  # Start with a minimum of 2 seconds delay
+        jitter=backoff.full_jitter,
+    )
+    def delete_with_backoff():
+        try:
+            response = s3.delete_objects(
+                Bucket=bucket, 
+                Delete={'Objects': objects, 'Quiet': False}
+            )
+            
+            if 'Errors' in response and response['Errors']:
+                for error in response['Errors']:
+                    error_code = error.get('Code', 'Unknown')
+                    
+                    # Check if the error indicates the object is already deleted
+                    if error_code in ['NoSuchKey', 'NoSuchBucket', 'NoSuchVersion', 'NotFound']:
+                        logger.debug(f"Object already deleted: {error.get('Key', 'Unknown')}")
+                    else:
+                        failed_objects.append({
+                            'Key': error.get('Key', 'Unknown'),
+                            'VersionId': error.get('VersionId', 'Unknown'),
+                            'Code': error_code,
+                            'Message': error.get('Message', 'Unknown')
+                        })
+                    
+            if throttle > 0:
+                time.sleep(throttle)
+                
+            return len(objects) - len(failed_objects)
+        
+        except botocore.exceptions.ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code')
+            
+            # Handle case where prefix has already been deleted
+            if error_code in ['NoSuchKey', 'NoSuchBucket', 'NoSuchVersion', 'NotFound', '404']:
+                logger.info(f"Prefix appears to be already deleted in bucket {bucket}: {error_code}")
+                # Return success since we don't need to delete these objects
+                return len(objects)
+            
+            # Re-raise for the backoff decorator to handle
+            raise
     
     try:
-        response = s3.delete_objects(
-            Bucket=bucket, 
-            Delete={'Objects': objects, 'Quiet': False}
-        )
-        
-        if 'Errors' in response and response['Errors']:
-            for error in response['Errors']:
-                failed_objects.append({
-                    'Key': error.get('Key', 'Unknown'),
-                    'VersionId': error.get('VersionId', 'Unknown'),
-                    'Code': error.get('Code', 'Unknown'),
-                    'Message': error.get('Message', 'Unknown')
-                })
-                
-        if throttle > 0:
-            time.sleep(throttle)
-            
-        return len(objects) - len(failed_objects), failed_objects
-    
+        success_count = delete_with_backoff()
+        return success_count, failed_objects
     except Exception as e:
-        logger.error(f"Failed batch delete in bucket {bucket}: {e}")
-        # Return all objects as failed in case of exception
+        logger.error(f"Failed batch delete in bucket {bucket} after all retries: {e}")
+        # Return all objects as failed in case of unhandled exception
         return 0, objects
+
 
 
 def extract_all_directory_levels(prefix: str, max_depth: int = -1) -> List[str]:
@@ -850,6 +921,9 @@ def delete(
     # Count lines efficiently
     logger.info(f"Counting objects in {csv_input}...")
     total_lines = count_file_lines(csv_input)
+
+    total_batches = total_lines // batch_size
+    logger.info(f"Total objects: {total_lines}, Batch size: {batch_size}, Total batches: {total_batches}")
     
     if skip_header and total_lines > 0:
         total_lines -= 1
@@ -934,7 +1008,8 @@ def delete(
                 for curr_bucket, batch in tqdm(
                     process_s3_deletion_batches(reader, batch_size),
                     desc="Processing S3 Batches",
-                    mininterval=1
+                    mininterval=1,
+                    total=total_batches,
                 )
             )
             
