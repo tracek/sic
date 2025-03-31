@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import csv
+import json
 import click
 import boto3
 import time
@@ -603,6 +604,181 @@ def find_and_write_delete_markers(bucket: str, prefix: str, output_file: Path,
     logger.info(f"Results written to {output_file}")
 
 
+def find_and_write_all_versions(bucket: str, prefix: str, output_file: Path, 
+                            jobs: int = 20, batch_size: int = 10000, 
+                            delimiter: str = '/', include_delete_markers: bool = True,
+                            include_versions: bool = True, latest_only: bool = False) -> None:
+    """
+    Find all object versions and/or delete markers in an S3 bucket and write them to a CSV file.
+    
+    Args:
+        bucket: S3 bucket name
+        prefix: Prefix to limit the search
+        output_file: Path to output CSV file
+        jobs: Number of parallel jobs
+        batch_size: Number of items to batch before writing
+        delimiter: Delimiter to use for prefix partitioning
+        include_delete_markers: Whether to include delete markers
+        include_versions: Whether to include non-delete-marker versions
+        latest_only: Whether to include only the latest versions/markers
+    """
+    # Create a queue for communication
+    item_queue = queue.Queue(maxsize=jobs * 2)  # Buffer some batches
+    stop_event = threading.Event()
+    total_items = [0]  # Use a list for mutable reference
+    
+    # Partition the prefix for parallel processing
+    logger.info(f"Partitioning prefix '{prefix}' for parallel processing")
+    prefixes = partition_prefix(bucket, prefix, delimiter, max_prefixes=jobs*10)
+    logger.info(f"Found {len(prefixes)} prefixes to process")
+    
+    # Writer thread function
+    def writer_thread():
+        items_written = 0
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['bucket', 'key', 'version_id', 'is_delete_marker', 'is_latest'])
+            
+            with tqdm(desc="Writing object versions", unit="items") as pbar:
+                while not (stop_event.is_set() and item_queue.empty()):
+                    try:
+                        batch = item_queue.get(timeout=1)
+                        if batch is None:  # Sentinel value
+                            break
+                            
+                        writer.writerows(batch)
+                        batch_size = len(batch)
+                        items_written += batch_size
+                        pbar.update(batch_size)
+                        item_queue.task_done()
+                    except queue.Empty:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error writing to file: {e}")
+                
+                total_items[0] = items_written
+    
+    # Start the writer thread
+    writer = threading.Thread(target=writer_thread)
+    writer.daemon = True
+    writer.start()
+    
+    # Process a single prefix chunk
+    def process_prefix_chunk(bucket: str, prefix: str, item_queue: queue.Queue, batch_size: int = 10000) -> int:
+        """
+        Process a single prefix chunk and put items into a queue.
+        
+        Returns:
+            Count of items found
+        """
+        s3 = boto3.client('s3')
+        paginator = s3.get_paginator('list_object_versions')
+        count = 0
+        batch = []
+        
+        try:
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                # Process delete markers
+                if include_delete_markers:
+                    delete_markers = page.get('DeleteMarkers', [])
+                    for marker in delete_markers:
+                        # Skip non-latest versions if latest_only is True
+                        if latest_only and not marker.get('IsLatest', False):
+                            continue
+                            
+                        batch.append((
+                            bucket,
+                            marker['Key'],
+                            marker['VersionId'],
+                            True,  # is_delete_marker
+                            marker.get('IsLatest', False)
+                        ))
+                        count += 1
+                        
+                        # If batch is full, put it in queue and reset
+                        if len(batch) >= batch_size:
+                            item_queue.put(batch)
+                            batch = []
+                
+                # Process regular versions
+                if include_versions:
+                    versions = page.get('Versions', [])
+                    for version in versions:
+                        # Skip delete markers (they were handled above)
+                        if version.get('IsDeleteMarker', False):
+                            continue
+                            
+                        # Skip non-latest versions if latest_only is True
+                        if latest_only and not version.get('IsLatest', False):
+                            continue
+                            
+                        batch.append((
+                            bucket,
+                            version['Key'],
+                            version['VersionId'],
+                            False,  # is_delete_marker
+                            version.get('IsLatest', False)
+                        ))
+                        count += 1
+                        
+                        # If batch is full, put it in queue and reset
+                        if len(batch) >= batch_size:
+                            item_queue.put(batch)
+                            batch = []
+            
+            # Put any remaining items
+            if batch:
+                item_queue.put(batch)
+                
+            return count
+        except Exception as e:
+            logger.error(f"Error processing prefix {prefix}: {e}")
+            if batch:
+                item_queue.put(batch)
+            return count
+    
+    # Process prefixes in parallel with progress tracking
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        # Submit all prefix chunks to executor
+        futures = {
+            executor.submit(
+                process_prefix_chunk, 
+                bucket, 
+                chunk_prefix, 
+                item_queue, 
+                batch_size
+            ): chunk_prefix for chunk_prefix in prefixes
+        }
+        
+        # Track progress with tqdm
+        with tqdm(total=len(prefixes), desc="Processing prefixes", unit="prefix") as pbar:
+            for future in as_completed(futures):
+                prefix_val = futures[future]
+                try:
+                    result = future.result()
+                    logger.debug(f"Prefix '{prefix_val}': Found {result} items")
+                except Exception as e:
+                    logger.error(f"Error processing prefix '{prefix_val}': {e}")
+                
+                pbar.update(1)
+    
+    # Signal the writer to stop
+    stop_event.set()
+    item_queue.put(None)
+    
+    # Wait for writer to finish
+    writer.join()
+    
+    if include_delete_markers and include_versions:
+        logger.success(f"Completed finding all object versions and delete markers. Total found: {total_items[0]}")
+    elif include_delete_markers:
+        logger.success(f"Completed finding delete markers. Total found: {total_items[0]}")
+    elif include_versions:
+        logger.success(f"Completed finding object versions. Total found: {total_items[0]}")
+    
+    logger.info(f"Results written to {output_file}")
+
+
 def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 1000000) -> None:
     """
     Create an Excel spreadsheet from multiple CSV files in a directory.
@@ -718,6 +894,79 @@ def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 
     
     except Exception as e:
         logger.error(f"Error creating Excel file: {e}")
+
+
+def load_inventory_json(json_file_path):
+    """Load and parse the inventory JSON file."""
+    with open(json_file_path, 'r') as file:
+        inventory_data = json.load(file)
+    return inventory_data
+
+def extract_filename(key):
+    """Extract just the filename from a path."""
+    return Path(key).name
+
+def download_s3_files(inventory_data, download_dir):
+    """
+    Download files from S3 based on inventory data using a flat structure.
+    
+    Args:
+        inventory_data: Parsed JSON inventory data
+        download_dir: Directory to save downloaded files (Path object)
+    """
+    # Create download directory if it doesn't exist
+    download_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Extract destination bucket from ARN
+    dest_bucket_arn = inventory_data["destinationBucket"]
+    dest_bucket = dest_bucket_arn.split(":::")[-1]
+    
+    # Create S3 client
+    s3_client = boto3.client('s3')
+    
+    # Track progress
+    total_files = len(inventory_data["files"])
+    downloaded_files = 0
+    failed_files = 0
+    
+    logger.info(f"Starting download of {total_files} files from bucket {dest_bucket}")
+    logger.info(f"Saving to directory: {download_dir.absolute()}")
+    
+    # Download each file
+    for i, file_info in enumerate(inventory_data["files"], 1):
+        inventory_key = file_info["key"]
+        size_bytes = file_info["size"]
+        
+        # Extract just the filename for a flat structure
+        filename = extract_filename(inventory_key)
+        
+        # Create the local file path (flat structure)
+        local_filepath = download_dir / filename
+        
+        logger.info(f"[{i}/{total_files}] Downloading {inventory_key} ({size_bytes/1024/1024:.2f} MB)...")
+        
+        try:
+            # Download the file
+            s3_client.download_file(dest_bucket, inventory_key, str(local_filepath))
+            
+            downloaded_files += 1
+            logger.success(f"Successfully downloaded: {filename}")
+            
+        except botocore.exceptions.ClientError as e:
+            logger.error(f"ERROR downloading {inventory_key}: {e}")
+            logger.error(f"Attempted to get object '{inventory_key}' from bucket '{dest_bucket}'")
+            failed_files += 1
+    
+    # Summary
+    logger.info("\nDownload Summary:")
+    logger.info(f"Total files: {total_files}")
+    logger.info(f"Successfully downloaded: {downloaded_files}")
+    logger.info(f"Failed: {failed_files}")
+    
+    if downloaded_files == total_files:
+        logger.success("All files downloaded successfully!")
+    else:
+        logger.warning("Some files failed to download.")
 
 
 @click.group()
@@ -1086,6 +1335,139 @@ def find_deleted(
     
     logger.info("Operation complete!")
 
+
+@cli.command()
+@click.option("--bucket", required=True, help="S3 bucket to scan")
+@click.option("--prefix", default="", show_default=True, help="Optional prefix to limit the search scope")
+@click.option("--output", required=True, type=click.Path(dir_okay=False, path_type=Path), help="Output CSV file path")
+@click.option("--jobs", "-j", default=20, show_default=True, type=int, help="Number of parallel jobs")
+@click.option("--batch-size", default=10000, show_default=True, type=int, help="Number of items to buffer before writing")
+@click.option("--delimiter", default="/", show_default=True, help="Delimiter to use for prefix partitioning")
+@click.option(
+    "--include-delete-markers/--exclude-delete-markers", 
+    default=True, 
+    show_default=True, 
+    help="Include delete markers in the output"
+)
+@click.option(
+    "--include-versions/--exclude-versions", 
+    default=True, 
+    show_default=True, 
+    help="Include non-delete-marker versions in the output"
+)
+@click.option(
+    "--latest-only/--all-versions", 
+    default=False, 
+    show_default=True, 
+    help="Include only the latest version of each object"
+)
+@click.option(
+    "--log-level",
+    default="INFO",
+    show_default=True,
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
+    help="Set the logging level",
+)
+def find_versions(
+    bucket: str,
+    prefix: str,
+    output: Path,
+    jobs: int,
+    batch_size: int,
+    delimiter: str,
+    include_delete_markers: bool,
+    include_versions: bool,
+    latest_only: bool,
+    log_level: str
+) -> None:
+    """
+    Find all object versions and/or delete markers in an S3 bucket and write them to a CSV file.
+    
+    This command efficiently searches for object versions and delete markers in a versioned S3 bucket
+    and writes the results to a CSV file with the format:
+    bucket,key,version_id,is_delete_marker,is_latest
+    
+    For buckets with hundreds of millions of objects, this command uses:
+    
+    1. Intelligent prefix partitioning to enable parallel processing
+    2. Multi-threaded S3 API calls for maximum throughput
+    3. Buffered writing to optimize I/O performance
+    4. Progress tracking for both prefix processing and output writing
+    
+    The output file can be used with the 'delete' command to permanently remove objects,
+    delete markers, or specific versions.
+    
+    Examples:
+    
+    # Find all object versions and delete markers
+    sic.py find-versions --bucket my-bucket --output all_versions.csv
+    
+    # Find only delete markers (same as find-deleted)
+    sic.py find-versions --bucket my-bucket --output delete_markers.csv --exclude-versions
+    
+    # Find only the latest version or delete marker of each object
+    sic.py find-versions --bucket my-bucket --output latest.csv --latest-only
+    
+    # Find all versions (excluding delete markers)
+    sic.py find-versions --bucket my-bucket --output versions.csv --exclude-delete-markers
+    """
+    # Configure logger
+    logger.remove()
+    logger.add(
+        sink=lambda msg: tqdm.write(msg, end=""),
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        level=log_level,
+    )
+    
+    # Show what we're going to do
+    actions = []
+    if include_delete_markers and include_versions:
+        actions.append("all object versions and delete markers")
+    elif include_delete_markers:
+        actions.append("delete markers")
+    elif include_versions:
+        actions.append("object versions")
+    
+    if latest_only:
+        actions.append("(latest versions only)")
+    
+    logger.info(f"Starting to find {' '.join(actions)} in bucket '{bucket}' with prefix '{prefix}'")
+    
+    # Create parent directory of output file if it doesn't exist
+    output.parent.mkdir(exist_ok=True, parents=True)
+    
+    # Run the search and write function
+    find_and_write_all_versions(
+        bucket, 
+        prefix, 
+        output, 
+        jobs, 
+        batch_size, 
+        delimiter,
+        include_delete_markers,
+        include_versions,
+        latest_only
+    )
+    
+    logger.info("Operation complete!")
+
+
+@cli.command()
+@click.option('--json', type=click.Path(exists=True, path_type=Path), required=True,
+              help='Path to the inventory JSON file')
+@click.option('--dir', type=click.Path(path_type=Path), 
+              help='Directory to save downloaded files')
+def download_from_manifest(json, dir):
+    """Download files from AWS S3 using an inventory JSON file with a flat output structure."""
+    try:
+        # Load inventory data
+        inventory_data = load_inventory_json(json)
+        
+        # Download files
+        download_s3_files(inventory_data, dir)
+    except Exception as e:
+        logger.error(f"Error: {e}")
+  
 
 if __name__ == "__main__":
     cli()
