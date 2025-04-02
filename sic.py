@@ -226,12 +226,12 @@ def extract_all_directory_levels(prefix: str, max_depth: int = -1) -> List[str]:
     return levels
 
 
-def process_csv_file(csv_file: Path, max_depth: int) -> Dict[int, Dict[str, Tuple[int, int]]]:
+def process_input_file(file_path: Path, max_depth: int) -> Dict[int, Dict[str, Tuple[int, int]]]:
     """
-    Process a single CSV file and return the aggregated sizes and file counts.
+    Process a single CSV or Parquet file and return the aggregated sizes and file counts.
 
     Args:
-        csv_file: Path to the CSV file
+        file_path: Path to the CSV or Parquet file
         max_depth: Maximum directory depth to consider
 
     Returns:
@@ -242,37 +242,82 @@ def process_csv_file(csv_file: Path, max_depth: int) -> Dict[int, Dict[str, Tupl
     level_data = defaultdict(lambda: defaultdict(lambda: [0, 0]))
 
     try:
-        with open(csv_file, "r", newline="") as f:
-            # Use csv module to handle quoted values
-            reader = csv.reader(f, quoting=csv.QUOTE_ALL)
+        file_extension = file_path.suffix.lower()
+        
+        if file_extension == '.csv':
+            with open(file_path, "r", newline="") as f:
+                # Use csv module to handle quoted values
+                reader = csv.reader(f, quoting=csv.QUOTE_ALL)
 
-            for row in reader:
+                for row in reader:
+                    try:
+                        if len(row) >= 3:  # Ensure row has at least 3 columns
+                            prefix = row[1]
+                            size_bytes = int(row[2])
+
+                            # Extract directory paths at all levels (top to bottom)
+                            dir_levels = extract_all_directory_levels(prefix, max_depth)
+
+                            # Detect if this is a file (not a directory)
+                            is_file = "." in prefix.split("/")[-1] if prefix else False
+
+                            # Aggregate sizes and count files for each level
+                            for level, dir_path in enumerate(dir_levels, 1):
+                                # Update size
+                                level_data[level][dir_path][0] += size_bytes
+
+                                # Update file count if this is a file
+                                if is_file:
+                                    level_data[level][dir_path][1] += 1
+                        else:
+                            raise ValueError(f"Invalid number of rows {len(row)} in {file_path}: {row}")
+                    except (IndexError, ValueError):
+                        logger.error(f"Error processing row in CSV file {file_path}: {row}")
+                        pass
+        elif file_extension == '.parquet':
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                logger.error("pandas and pyarrow are required for Parquet support. Please install them with 'pip install pandas pyarrow'")
+                return {}
+            
+            # Read the parquet file
+            table = pq.read_table(file_path)
+            df = table.to_pandas()
+            
+            # Ensure the dataframe has the required columns
+            if len(df.columns) < 3:
+                logger.error(f"Parquet file {file_path} does not have enough columns (expected at least 3)")
+                return {}
+            
+            # Process each row in the dataframe
+            for _, row in df.iterrows():
                 try:
-                    if len(row) >= 3:  # Ensure row has at least 3 columns
-                        prefix = row[1]
-                        size_bytes = int(row[2])
-
-                        # Extract directory paths at all levels (top to bottom)
-                        dir_levels = extract_all_directory_levels(prefix, max_depth)
-
-                        # Detect if this is a file (not a directory)
-                        is_file = "." in prefix.split("/")[-1] if prefix else False
-
-                        # Aggregate sizes and count files for each level
-                        for level, dir_path in enumerate(dir_levels, 1):
-                            # Update size
-                            level_data[level][dir_path][0] += size_bytes
-
-                            # Update file count if this is a file
-                            if is_file:
-                                level_data[level][dir_path][1] += 1
-                    else:
-                        raise ValueError(f"Invalid number of rows {len(row)} in {csv_file}: {row}")
-                except (IndexError, ValueError):
-                    logger.error(f"Error processing row in CSV file {csv_file}: {row}")
+                    prefix = row['key']  # Second column contains the prefix/key
+                    size_bytes = int(row['size'])  # Third column contains the size
+                    
+                    # Extract directory paths at all levels (top to bottom)
+                    dir_levels = extract_all_directory_levels(prefix, max_depth)
+                    
+                    # Detect if this is a file (not a directory)
+                    is_file = "." in prefix.split("/")[-1] if prefix else False
+                    
+                    # Aggregate sizes and count files for each level
+                    for level, dir_path in enumerate(dir_levels, 1):
+                        # Update size
+                        level_data[level][dir_path][0] += size_bytes
+                        
+                        # Update file count if this is a file
+                        if is_file:
+                            level_data[level][dir_path][1] += 1
+                except (IndexError, ValueError, TypeError) as e:
+                    logger.error(f"Error processing row in Parquet file {file_path}: {e}")
                     pass
+        else:
+            logger.error(f"Unsupported file type: {file_extension}")
+            
     except Exception as e:
-        logger.error(f"Error processing file {csv_file}: {e}")
+        logger.error(f"Error processing file {file_path}: {e}")
 
     # Convert the defaultdict values to tuples for better serialization
     result = {}
@@ -283,13 +328,13 @@ def process_csv_file(csv_file: Path, max_depth: int) -> Dict[int, Dict[str, Tupl
 
 
 def process_files_in_batches(
-    csv_files: List[Path], max_depth: int, n_jobs: int, batch_size: int = 10
+    input_files: List[Path], max_depth: int, n_jobs: int, batch_size: int = 10
 ) -> List[Dict[int, Dict[str, Tuple[int, int]]]]:
     """
     Process files in batches with a progress bar.
 
     Args:
-        csv_files: List of CSV files to process
+        input_files: List of CSV and Parquet files to process
         max_depth: Maximum directory depth to consider
         n_jobs: Number of parallel jobs
         batch_size: Size of batches for parallel processing
@@ -299,11 +344,11 @@ def process_files_in_batches(
     """
     results = []
 
-    with tqdm(total=len(csv_files), desc="Processing CSV files") as pbar:
-        for i in range(0, len(csv_files), batch_size):
-            batch_files = csv_files[i : i + batch_size]
+    with tqdm(total=len(input_files), desc="Processing input files") as pbar:
+        for i in range(0, len(input_files), batch_size):
+            batch_files = input_files[i : i + batch_size]
             batch_results = Parallel(n_jobs=n_jobs)(
-                delayed(process_csv_file)(csv_file, max_depth) for csv_file in batch_files
+                delayed(process_input_file)(file_path, max_depth) for file_path in batch_files
             )
             results.extend(batch_results)
             pbar.update(len(batch_files))
@@ -339,7 +384,7 @@ def combine_results(
     return result
 
 
-def process_csv_files(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int) -> None:
+def process_input_files(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int) -> None:
     """
     Process all CSV files in the input directory and generate aggregated reports.
     Uses parallel processing to speed up file processing.
@@ -352,15 +397,17 @@ def process_csv_files(input_dir: Path, output_dir: Path, max_depth: int, n_jobs:
     """
     # Find all CSV files in the input directory
     csv_files = list(input_dir.glob("*.csv"))
+    parequet_files = list(input_dir.glob("*.parquet"))
+    input_files = csv_files + parequet_files
 
-    if not csv_files:
-        logger.warning(f"No CSV files found in {input_dir}")
+    if not input_files:
+        logger.warning(f"No input files found in {input_dir}")
         return
 
-    logger.info(f"Found {len(csv_files)} CSV files to process")
+    logger.info(f"Found {len(input_files)} files to process")
 
     # Process files in parallel with tqdm progress bar
-    results = process_files_in_batches(csv_files, max_depth, n_jobs)
+    results = process_files_in_batches(input_files, max_depth, n_jobs)
 
     # Combine results from all processes
     logger.info("Combining results from all files...")
@@ -982,7 +1029,7 @@ def cli() -> None:
     "--input-dir",
     required=True,
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-    help="Directory containing CSV files",
+    help="Directory containing CSV and Parquet files",
 )
 @click.option(
     "--output-dir",
@@ -1013,9 +1060,9 @@ def cli() -> None:
 )
 def analyze(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_level: str) -> None:
     """
-    Process AWS S3 Inventory CSV files and aggregate storage by directory levels.
+    Process AWS S3 Inventory CSV or Parquet files and aggregate storage by directory levels.
 
-    This command reads AWS S3 Inventory CSV files and aggregates storage sizes at
+    This command reads AWS S3 Inventory CSV or Parquet files and aggregates storage sizes at
     directory levels, where level 1 is the top-most directory (e.g., slr0/, slr1/, slr2/)
     and each subsequent level goes one directory deeper, outputting results in GB.
 
@@ -1034,8 +1081,8 @@ def analyze(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_
     output_dir.mkdir(exist_ok=True, parents=True)
     logger.debug(f"Ensured output directory exists: {output_dir}")
 
-    # Process CSV files
-    process_csv_files(input_dir, output_dir, max_depth, n_jobs)
+    # Process CSV and Parquet files
+    process_input_files(input_dir, output_dir, max_depth, n_jobs)
 
     logger.info("Analysis complete!")
 

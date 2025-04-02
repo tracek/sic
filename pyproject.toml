@@ -16,6 +16,7 @@ pandas = "^2.2.3"
 openpyxl = "^3.1.5"
 boto3 = "^1.37.21"
 backoff = "^2.2.1"
+pyarrow = "^19.0.1"
 
 
 [tool.poetry.group.dev.dependencies]
