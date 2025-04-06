@@ -826,17 +826,23 @@ def find_and_write_all_versions(bucket: str, prefix: str, output_file: Path,
     logger.info(f"Results written to {output_file}")
 
 
-def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 1000000) -> None:
+def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 1000000,
+                   min_size_gb: float = 1.0, min_objects: int = 10000) -> None:
     """
     Create an Excel spreadsheet from multiple CSV files in a directory.
     Each CSV file becomes a separate sheet in the Excel workbook.
     Sheets are ordered by the level number in the CSV filename.
     If a sheet would have more than max_rows_per_sheet rows, it is split into multiple sheets.
+    
+    Rows with size smaller than min_size_gb (in GB) and with fewer objects than min_objects
+    will be skipped.
 
     Args:
         csv_dir: Directory containing the CSV files
         output_file: Path where the Excel file will be saved
         max_rows_per_sheet: Maximum number of rows per sheet (default: 1,000,000)
+        min_size_gb: Minimum size in GB to include a row (default: 1.0)
+        min_objects: Minimum number of objects to include a row (default: 10,000)
     """
     try:
         import pandas as pd
@@ -872,6 +878,21 @@ def export_to_excel(csv_dir: Path, output_file: Path, max_rows_per_sheet: int = 
             for csv_file in tqdm(csv_files, desc="Exporting to Excel"):
                 # Read CSV file
                 df = pd.read_csv(csv_file)
+                
+                # Filter rows based on size and object count
+                if 'Size (GB)' in df.columns and 'File Count' in df.columns:
+                    original_row_count = len(df)
+                    df = df[(df['Size (GB)'] >= min_size_gb) | (df['File Count'] >= min_objects)]
+                    filtered_row_count = len(df)
+                    
+                    if filtered_row_count < original_row_count:
+                        logger.info(f"Filtered {original_row_count - filtered_row_count} rows from {csv_file.name} " 
+                                   f"(min size: {min_size_gb} GB, min objects: {min_objects})")
+                
+                # Skip if no rows left after filtering
+                if len(df) == 0:
+                    logger.warning(f"Skipping {csv_file.name} - no rows left after filtering")
+                    continue
                 
                 # Use level number as sheet name (e.g., "Level 1")
                 level_num = extract_level(csv_file)
@@ -1108,13 +1129,27 @@ def analyze(input_dir: Path, output_dir: Path, max_depth: int, n_jobs: int, log_
     help="Maximum number of rows per sheet. Sheets with more rows will be split",
 )
 @click.option(
+    "--min-size-gb",
+    default=1.0,
+    show_default=True,
+    type=float,
+    help="Skip rows with size smaller than this value (in GB)",
+)
+@click.option(
+    "--min-objects",
+    default=10000,
+    show_default=True,
+    type=int,
+    help="Skip rows with fewer objects than this value",
+)
+@click.option(
     "--log-level",
     default="INFO",
     show_default=True,
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
     help="Set the logging level",
 )
-def excel_export(input_dir: Path, output_file: Path, max_rows: int, log_level: str) -> None:
+def excel_export(input_dir: Path, output_file: Path, max_rows: int, min_size_gb: float, min_objects: int, log_level: str) -> None:
     """
     Export CSV reports to a single Excel file with multiple sheets.
     
@@ -1124,6 +1159,10 @@ def excel_export(input_dir: Path, output_file: Path, max_rows: int, log_level: s
     
     If a sheet would have more than the specified maximum number of rows (default: 1,000,000),
     it will be split into multiple sheets with appropriate range indicators.
+    
+    You can filter out small directories by setting minimum size (--min-size-gb) and/or
+    minimum objects count (--min-objects) thresholds. Rows not meeting both criteria
+    will be excluded from the Excel file.
     """
     # Configure logger level
     logger.remove()
@@ -1133,16 +1172,15 @@ def excel_export(input_dir: Path, output_file: Path, max_rows: int, log_level: s
         level=log_level,
     )
     
-    logger.info(f"Starting export to Excel (max {max_rows:,} rows per sheet)")
+    logger.info(f"Starting export to Excel (max {max_rows:,} rows per sheet, min size: {min_size_gb} GB, min objects: {min_objects})")
     
     # Create parent directory of output file if it doesn't exist
     output_file.parent.mkdir(exist_ok=True, parents=True)
     
     # Export CSV files to Excel
-    export_to_excel(input_dir, output_file, max_rows_per_sheet=max_rows)
+    export_to_excel(input_dir, output_file, max_rows_per_sheet=max_rows, min_size_gb=min_size_gb, min_objects=min_objects)
     
     logger.info("Export complete!")
-
 
 @cli.command()
 @click.argument("csv_input", type=click.Path(exists=True, path_type=Path))
