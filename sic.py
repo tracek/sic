@@ -1376,7 +1376,7 @@ def download_from_manifest(json, dir):
 
 @cli.command()
 @click.option("--bucket", required=True, help="S3 bucket containing the prefix to list")
-@click.option("--prefix", required=True, help="Prefix to list (without leading/trailing slash)")
+@click.option("--prefix", default="", show_default=True, help="Prefix to list (without leading/trailing slash)")
 @click.option("--output", required=True, type=click.Path(dir_okay=False, path_type=Path), help="Output CSV file path")
 @click.option("--include-versions", is_flag=True, default=False, help="Include all versions if bucket has versioning enabled")
 @click.option("--include-size", is_flag=True, default=False, help="Include object size information")
