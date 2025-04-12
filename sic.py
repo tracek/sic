@@ -1037,7 +1037,7 @@ def download_s3_files(inventory_data, download_dir):
         logger.warning("Some files failed to download.")
 
 
-@click.group()
+@click.group(context_settings=dict(max_content_width=120))
 def cli() -> None:
     """
     S3 Storage Analysis Tool - Process and visualize S3 inventory data
