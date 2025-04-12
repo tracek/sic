@@ -1561,6 +1561,10 @@ def download_from_manifest(json, dir):
 @click.option("--include-versions", is_flag=True, default=False, help="Include all versions if bucket has versioning enabled")
 @click.option("--include-size", is_flag=True, default=False, help="Include object size information")
 @click.option("--max-keys", default=1000, show_default=True, type=int, help="Number of keys to fetch per API call")
+@click.option("--storage-class", 
+    type=click.Choice(["STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA", 
+    "INTELLIGENT_TIERING", "GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"]),
+    help="Filter objects by storage class")
 @click.option(
     "--log-level",
     default="INFO",
@@ -1575,6 +1579,7 @@ def list_prefix(
     include_versions: bool,
     include_size: bool,
     max_keys: int,
+    storage_class: Optional[str],
     log_level: str,
 ) -> None:
     """
@@ -1583,6 +1588,8 @@ def list_prefix(
     This command lists all objects under the given prefix and saves them to a CSV file.
     If --include-versions is specified, it will list all versions of each object 
     (only relevant when bucket versioning is enabled).
+    
+    Use --storage-class to filter objects by their storage class.
     
     The CSV file can be used with the 'delete-prefix' command to delete specific objects.
     
@@ -1596,6 +1603,9 @@ def list_prefix(
     
     # List objects with size information
     sic.py list-prefix --bucket my-bucket --prefix folder/to/list --output objects.csv --include-size
+    
+    # List only STANDARD storage class objects
+    sic.py list-prefix --bucket my-bucket --prefix folder/to/list --output objects.csv --storage-class STANDARD
     """
     # Configure logger
     logger.remove()
@@ -1622,17 +1632,19 @@ def list_prefix(
         # Define CSV headers based on options
         if include_versions:
             if include_size:
-                headers = ['bucket', 'key', 'version_id', 'is_latest', 'is_delete_marker', 'size_bytes', 'last_modified']
+                headers = ['bucket', 'key', 'version_id', 'is_latest', 'is_delete_marker', 'size_bytes', 'last_modified', 'storage_class']
             else:
-                headers = ['bucket', 'key', 'version_id', 'is_latest', 'is_delete_marker']
+                headers = ['bucket', 'key', 'version_id', 'is_latest', 'is_delete_marker', 'storage_class']
         else:
             if include_size:
-                headers = ['bucket', 'key', 'size_bytes', 'last_modified']
+                headers = ['bucket', 'key', 'size_bytes', 'last_modified', 'storage_class']
             else:
-                headers = ['bucket', 'key']
+                headers = ['bucket', 'key', 'storage_class']
         
         # Write to CSV file
         object_count = 0
+        skipped_count = 0
+        
         with open(output, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(headers)
@@ -1646,6 +1658,12 @@ def list_prefix(
                                 desc="Listing object versions", unit="batch"):
                     # Process versions
                     for version in page.get('Versions', []):
+                        # Check storage class if filter is specified
+                        curr_storage_class = version.get('StorageClass', 'STANDARD')
+                        if storage_class and curr_storage_class != storage_class:
+                            skipped_count += 1
+                            continue
+                            
                         row = [
                             bucket,
                             version['Key'],
@@ -1659,12 +1677,20 @@ def list_prefix(
                                 version.get('Size', 0),
                                 version.get('LastModified', '').isoformat() if hasattr(version.get('LastModified', ''), 'isoformat') else version.get('LastModified', '')
                             ])
-                            
+                        
+                        # Always include storage class
+                        row.append(curr_storage_class)
+                        
                         writer.writerow(row)
                         object_count += 1
                     
                     # Process delete markers
                     for marker in page.get('DeleteMarkers', []):
+                        # Delete markers don't have a storage class, skip if filtering by storage class
+                        if storage_class:
+                            skipped_count += 1
+                            continue
+                            
                         row = [
                             bucket,
                             marker['Key'],
@@ -1679,7 +1705,10 @@ def list_prefix(
                                 0,  # size is 0 for delete markers
                                 marker.get('LastModified', '').isoformat() if hasattr(marker.get('LastModified', ''), 'isoformat') else marker.get('LastModified', '')
                             ])
-                            
+                        
+                        # Delete markers don't have a storage class    
+                        row.append("N/A")
+                        
                         writer.writerow(row)
                         object_count += 1
             else:
@@ -1689,6 +1718,12 @@ def list_prefix(
                 for page in tqdm(paginator.paginate(Bucket=bucket, Prefix=prefix, MaxKeys=max_keys),
                                 desc="Listing objects", unit="batch"):
                     for obj in page.get('Contents', []):
+                        # Check storage class if filter is specified
+                        curr_storage_class = obj.get('StorageClass', 'STANDARD')
+                        if storage_class and curr_storage_class != storage_class:
+                            skipped_count += 1
+                            continue
+                            
                         row = [
                             bucket,
                             obj['Key']
@@ -1699,12 +1734,19 @@ def list_prefix(
                                 obj.get('Size', 0),
                                 obj.get('LastModified', '').isoformat() if hasattr(obj.get('LastModified', ''), 'isoformat') else obj.get('LastModified', '')
                             ])
-                            
+                        
+                        # Always include storage class
+                        row.append(curr_storage_class)
+                        
                         writer.writerow(row)
                         object_count += 1
         
         version_str = "versions and delete markers" if include_versions else "objects"
-        logger.success(f"Listed {object_count} {version_str} under prefix '{prefix}' in bucket '{bucket}'")
+        storage_class_str = f" with storage class '{storage_class}'" if storage_class else ""
+        
+        logger.success(f"Listed {object_count} {version_str}{storage_class_str} under prefix '{prefix}' in bucket '{bucket}'")
+        if skipped_count > 0:
+            logger.info(f"Skipped {skipped_count} objects that didn't match the storage class filter")
         logger.info(f"Results saved to {output}")
         
     except botocore.exceptions.ClientError as e:
@@ -2145,7 +2187,7 @@ def move_storage_class(
                 
                 # Check if file is valid
                 if 'bucket' not in headers or 'key' not in headers:
-                    logger.error(f"Invalid input file format. File must have 'bucket' and 'key' columns.")
+                    logger.error("Invalid input file format. File must have 'bucket' and 'key' columns.")
                     return
                 
                 # Determine indexes for relevant columns
