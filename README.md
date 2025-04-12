@@ -1,101 +1,146 @@
-# S3 inventory calculator
+# S3 Inventory Command-line (SIC)
 
-A Python CLI tool for analyzing AWS S3 inventory reports and generating size reports by directory level.
+A command-line tool for managing and analyzing AWS S3 storage at scale.
+
+## Overview
+
+SIC is a Python command-line utility for working with AWS S3 storage, designed to handle large-scale operations efficiently. It helps with storage analysis, object management, and migrating between storage classes.
 
 ## Features
 
-- Processes AWS S3 inventory CSV files to aggregate storage usage by directory levels
-- Supports parallel processing for faster analysis of large inventory files
-- Generates CSV reports for each directory level showing sizes and file counts
-- Exports analysis results to Excel with auto-formatted sheets
-- Handles large datasets by automatically splitting sheets that exceed Excel's row limits
+- **Storage Analysis**: Process S3 inventory files to aggregate and visualize storage usage by directory levels
+- **Delete Marker Management**: Find and manage delete markers in versioned buckets
+- **Version Management**: List and manipulate object versions
+- **Storage Class Migration**: Move objects between storage classes
+- **Prefix Operations**: List and delete objects under specific prefixes
+- **Optimized for Scale**: Uses parallel processing, throttling, and batching to handle millions of objects
 
-## Usage
+## Command Reference
 
-### Analyzing S3 Inventory Files
+```
+Usage: sic.py [OPTIONS] COMMAND [ARGS]...
+
+  S3 Storage Analysis Tool - Process and visualize S3 inventory data
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  analyze                 Process AWS S3 Inventory CSV or Parquet files...
+  delete-prefix           Delete objects listed in a CSV file (generated...
+  download-from-manifest  Download files from AWS S3 using an inventory...
+  excel-export            Export CSV reports to a single Excel file with...
+  find-deleted            Find all objects with delete markers in an S3...
+  find-versions           Find all object versions and/or delete markers...
+  list-prefix             List all objects under a specified prefix in an...
+  move-storage-class      Move objects to a different storage class while...
+```
+
+### Analyze S3 Storage
 
 ```bash
-python s3_storage_analysis.py analyze \
-  --input-dir /path/to/inventory/csv/files \
-  --output-dir /path/to/output/directory \
-  --max-depth 3
+python sic.py analyze --input-dir /path/to/inventory --output-dir /path/to/results --max-depth 3
 ```
 
-This will:
-1. Process all CSV files in the input directory
-2. Generate level-based reports in the output directory
-3. Create files named `level_1_sizes.csv`, `level_2_sizes.csv`, etc.
+Processes S3 inventory files to aggregate storage by directory level, creating size reports for each level.
 
-### Excel Export
-
-After generating CSV reports, you can export them to a single Excel file:
+### Export to Excel
 
 ```bash
-python s3_storage_analysis.py excel-export \
-  --input-dir /path/to/csv/reports \
-  --output-file storage_report.xlsx
+python sic.py excel-export --input-dir /path/to/reports --output-file summary.xlsx
 ```
 
-For large datasets that might exceed Excel's row limits:
+Creates a formatted Excel file from CSV reports, with filtering for size and object count.
+
+### Find Delete Markers
 
 ```bash
-python s3_storage_analysis.py excel-export \
-  --input-dir /path/to/csv/reports \
-  --output-file storage_report.xlsx \
-  --max-rows 500000
+python sic.py find-deleted --bucket mybucket --prefix data/ --output markers.csv
 ```
 
-## Command Options
+Finds all objects with delete markers in a bucket, useful for restoring accidentally deleted objects.
 
-### Analyze Command
+### Find Object Versions
 
-```
---input-dir      Directory containing S3 inventory CSV files (required)
---output-dir     Directory to save the CSV reports (required)
---max-depth      Maximum directory depth to analyze (-1 for unlimited, default: -1)
---n-jobs         Number of parallel jobs (-1 for all cores, default: -1)
---log-level      Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL, default: INFO)
+```bash
+python sic.py find-versions --bucket mybucket --prefix logs/ --output versions.csv
 ```
 
-### Excel Export Command
+Lists all versions of objects in a versioned bucket, with options to filter by version type.
 
-```
---input-dir      Directory containing generated CSV reports (required)
---output-file    Path to save the Excel file (required)
---max-rows       Maximum rows per sheet (default: 1,000,000)
---log-level      Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL, default: INFO)
-```
+### List Objects in a Prefix
 
-## Output Format
-
-### CSV Reports
-
-Each level report contains:
-- Directory path
-- Size in GB
-- File count
-
-Example `level_1_sizes.csv`:
-```
-Directory,Size (GB),File Count
-data/,1250.45,12500
-logs/,850.22,9800
-backups/,650.75,4200
+```bash
+python sic.py list-prefix --bucket mybucket --prefix data/ --output objects.csv --include-size
 ```
 
-### Excel Export
+Lists all objects under a prefix, with options to include size information and filter by storage class.
 
-The Excel file contains:
-- One sheet per CSV report (named "Level 1", "Level 2", etc.)
-- Auto-adjusted column widths
-- If a sheet exceeds the row limit, it's split into multiple sheets (e.g., "Level 1 (1-1000000)", "Level 1 (1000001-1500000)")
+### Delete Objects by Prefix
 
-## Performance Tips
+```bash
+python sic.py delete-prefix --input-file objects.csv --dry-run
+```
 
-- Processing large inventory files can be memory-intensive. Adjust `--n-jobs` if memory is limited.
-- For analyzing very deep directory structures, use `--max-depth` to limit analysis.
-- The Excel export feature works best for reports under a few million rows total.
+Deletes objects listed in a CSV file, with batch processing and error logging.
 
-## License
+### Move Objects to Different Storage Class
 
-[MIT License](LICENSE)
+```bash
+python sic.py move-storage-class --bucket mybucket --prefix logs/2023/ --storage-class GLACIER
+```
+
+Changes the storage class of objects while maintaining their original prefixes.
+
+### Download from S3 Inventory Manifest
+
+```bash
+python sic.py download-from-manifest --json inventory-manifest.json --dir /download/path
+```
+
+Downloads files listed in an S3 inventory manifest JSON file.
+
+## Examples
+
+### Analyze S3 Storage and Export to Excel
+
+```bash
+# Process inventory files and create reports
+python sic.py analyze --input-dir /inventory --output-dir /reports --max-depth 3
+
+# Export reports to Excel for sharing
+python sic.py excel-export --input-dir /reports --output-file storage_report.xlsx --min-size-gb 1.0
+```
+
+### Find and Remove Delete Markers
+
+```bash
+# Find delete markers
+python sic.py find-deleted --bucket mybucket --output delete_markers.csv
+
+# Delete the markers (after review)
+python sic.py delete-prefix --input-file delete_markers.csv
+```
+
+### Move Old Data to Glacier Storage
+
+```bash
+# List objects
+python sic.py list-prefix --bucket mybucket --prefix logs/2022/ --output old_logs.csv --include-size
+
+# Move to Glacier
+python sic.py move-storage-class --bucket mybucket --input-file old_logs.csv --storage-class GLACIER
+```
+
+## Performance Considerations
+
+- For large buckets (100M+ objects), use the `--batch-size` and `--throttle` options to avoid API rate limits
+- Use `--jobs` parameter to control parallelism based on your system's capabilities
+- For inventory analysis, processing Parquet files is faster than CSV
+
+## Safety Features
+
+- `--dry-run` option for simulating operations without making changes
+- Confirmation prompts before destructive operations
+- Error logging for failed operations
+- Exponential backoff for API rate limits
